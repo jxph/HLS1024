@@ -107,6 +107,7 @@ HLS1024/
 ├── hls1024.py       # Core reference implementation
 ├── test.py          # Validation suite
 ├── LICENSE          # License information
+├── Kats.json        # Known Answer test Results
 └── README.md        # Documentation
 ```
 
