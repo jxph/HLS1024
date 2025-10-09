@@ -2,26 +2,30 @@
 #   HLS-1024 : Post-Quantum Hash Function
 #   Version  : v0.1
 #   Author   : JXPH
-#   Purpose  : Reference Build
+#   Purpose  : Reference Build (Baseline)
 # =========================================================
 
 from hashlib import shake_128, shake_256
 from typing import List, Optional
 import sys, argparse
 
+# =========================================================
+#   GLOBAL PARAMETERS
+# =========================================================
+
 PrimeModulus: Optional[int] = None
 StateSize = 512
-RoundCount = 24
+RoundCount = 16
 OutputBitLength = 1024
 _BLOCK_BYTES = 64
-_SEED_STRING = b"HLS-1024-SEED-v1.0"
+_SEED_STRING = b"HLS-1024-v0.1"
 
 _WORD_BITS: Optional[int] = None
 _BYTES_PER_ELEM: Optional[int] = None
 
 
 # =========================================================
-#   PARAMETER / CONSTANT INITIALIZATION
+#   PARAMETER INITIALIZATION
 # =========================================================
 def InitializeParameters():
     global PrimeModulus, _WORD_BITS, _BYTES_PER_ELEM
@@ -46,6 +50,9 @@ def BytesPerElem() -> int:
     return _BYTES_PER_ELEM
 
 
+# =========================================================
+#   INTERNAL UTILS
+# =========================================================
 def _shake_ints(seed: bytes, count: int, bytes_per_int: Optional[int] = None) -> List[int]:
     InitializeParameters()
     if bytes_per_int is None:
@@ -55,19 +62,13 @@ def _shake_ints(seed: bytes, count: int, bytes_per_int: Optional[int] = None) ->
     return [int.from_bytes(raw[i * bytes_per_int:(i + 1) * bytes_per_int], "big") for i in range(count)]
 
 
-def derive_const(label: bytes, n: int, bytes_per_int: Optional[int] = None) -> List[int]:
+def derive_const(label: bytes, n: int) -> List[int]:
     seed = _SEED_STRING + b"::const::" + label
-    return _shake_ints(seed, n, bytes_per_int)
+    return [x % PrimeModulus for x in _shake_ints(seed, n)]
 
 
 def InitializeState() -> List[int]:
-    InitializeParameters()
-    return [x % PrimeModulus for x in derive_const(b"initial-state", StateSize)]
-
-
-def GenerateMixingVector(seed_value: bytes) -> List[int]:
-    label = b"mixvec::" + seed_value
-    return [x % PrimeModulus for x in derive_const(label, StateSize)]
+    return derive_const(b"init", StateSize)
 
 
 # =========================================================
@@ -78,91 +79,68 @@ def rol(x: int, r: int, bits: int) -> int:
     return ((x << r) | (x >> (bits - r))) & ((1 << bits) - 1)
 
 
-def AbsorbMessageBlock(state: List[int], message_block: bytes) -> List[int]:
-    InitializeParameters()
-    n = len(state)
-    word_bytes = 8
-    if len(message_block) % word_bytes != 0:
-        message_block += b"\x00" * (word_bytes - len(message_block) % word_bytes)
-    words = [int.from_bytes(message_block[i:i + word_bytes], "big") for i in range(0, len(message_block), word_bytes)]
+def AbsorbMessageBlock(state: List[int], block: bytes) -> List[int]:
     s = state.copy()
+    WB = WordBits()
+    word_bytes = 8
+    if len(block) % word_bytes != 0:
+        block += b"\x00" * (word_bytes - len(block) % word_bytes)
+    words = [int.from_bytes(block[i:i + word_bytes], "big") for i in range(0, len(block), word_bytes)]
     for i, w in enumerate(words):
-        idx = i % n
-        s[idx] = (s[idx] + (w % PrimeModulus)) % PrimeModulus
-        s[(idx + 1) % n] ^= (w >> 32) & ((1 << WordBits()) - 1)
-    extra = shake_128(_SEED_STRING + b"::absorb::" + message_block).digest(BytesPerElem() * 2)
-    for j, bv in enumerate(extra):
-        s[j % n] = (s[j % n] ^ bv) % PrimeModulus
+        idx = i % len(s)
+        s[idx] = (s[idx] + w) % PrimeModulus
+        s[(idx + 1) % len(s)] ^= (w >> 16) & ((1 << WB) - 1)
     return s
 
 
-def ApplyLinearDiffusion(state: List[int], mv: List[int]) -> List[int]:
+def ApplyLinearDiffusion(state: List[int]) -> List[int]:
     n = len(state)
     WB = WordBits()
-    o = [0] * n
+    out = [0] * n
     for i in range(n):
-        x, y, z, k = state[i], state[(i + 1) % n], state[(i + 7) % n], mv[i]
-        v = (x + ((y ^ z) * (k | 1))) % PrimeModulus
-        v = rol(v, k, WB)
-        o[i] = (v + (y ^ (z >> 3))) % PrimeModulus
-    return o
+        a, b, c = state[i], state[(i + 1) % n], state[(i + 7) % n]
+        mix = (a + (b ^ (c >> 3))) % PrimeModulus
+        out[i] = rol(mix, (i * 3) % WB, WB)
+    return out
 
 
 def ApplyNonLinearConfusion(state: List[int]) -> List[int]:
-    WB = WordBits()
     o = []
     for x in state:
-        x3, x5 = pow(x, 3, PrimeModulus), pow(x, 5, PrimeModulus)
-        rot_amount = (x >> 5) & (WB - 1)
-        rot = rol(x, int(rot_amount), WB)
-        o.append((x3 + x5 + rot + 17) % PrimeModulus)
+        x3 = pow(x, 3, PrimeModulus)
+        x5 = pow(x, 5, PrimeModulus)
+        o.append((x3 + x5 + 17) % PrimeModulus)
     return o
 
 
-def RotateState(state: List[int], r: int) -> List[int]:
-    n = len(state)
-    if not n:
-        return state.copy()
-    r %= n
-    return state[-r:] + state[:-r] if r else state.copy()
-
-
-def PerformRound(state: List[int], block: bytes, mv: List[int]) -> List[int]:
-    tweak = shake_128(_SEED_STRING + b"::round-tweak::" + block).digest(16)
-    s = AbsorbMessageBlock(state, tweak)
-    s = ApplyLinearDiffusion(s, mv)
+def PerformRound(state: List[int]) -> List[int]:
+    s = ApplyLinearDiffusion(state)
     s = ApplyNonLinearConfusion(s)
-    s = RotateState(s, mv[0] % len(s))
     return s
 
 
+# =========================================================
+#   FINALIZATION
+# =========================================================
 def FinalizeState(state: List[int]) -> List[int]:
-    final_mv = GenerateMixingVector(_SEED_STRING + b"::finalize")
-    s = AbsorbMessageBlock(state, b"HLS-1024-FINALIZE")
-    for i in range(max(4, RoundCount // 3)):
-        s = ApplyLinearDiffusion(s, final_mv)
+    s = state.copy()
+    for _ in range(4):
+        s = ApplyLinearDiffusion(s)
         s = ApplyNonLinearConfusion(s)
-        s = RotateState(s, (i * 13) % len(s))
     return s
 
 
 def ExtractDigest(state: List[int]) -> bytes:
     InitializeParameters()
-    out_bytes = OutputBitLength // 8
     xof = shake_256()
-    domain_info = (
-        f"HLS1024|v1.0|StateSize={StateSize}|Rounds={RoundCount}|PrimeBits={PrimeModulus.bit_length()}|OutBits={OutputBitLength}".encode()
-    )
-    xof.update(domain_info)
-    bpe = BytesPerElem()
+    xof.update(_SEED_STRING + b"::extract")
     for v in state:
-        xof.update(int(v).to_bytes(bpe, "big"))
-    xof.update(b"::hls1024-extract")
-    return xof.digest(out_bytes)
+        xof.update(int(v).to_bytes(BytesPerElem(), "big"))
+    return xof.digest(OutputBitLength // 8)
 
 
 # =========================================================
-#   MESSAGE & TOP-LEVEL HASH
+#   TOP-LEVEL HASH
 # =========================================================
 def SplitIntoBlocks(message: bytes) -> List[bytes]:
     L = len(message)
@@ -175,31 +153,31 @@ def SplitIntoBlocks(message: bytes) -> List[bytes]:
 def HLS1024Hash(message: bytes) -> bytes:
     if not isinstance(message, (bytes, bytearray)):
         raise TypeError("HLS1024Hash expects bytes")
-    InitializeParameters()
     state = InitializeState()
-    for i, blk in enumerate(SplitIntoBlocks(bytes(message))):
-        mv_seed = _SEED_STRING + b"::block::" + i.to_bytes(8, "big")
-        mv = GenerateMixingVector(mv_seed)
+    for blk in SplitIntoBlocks(message):
         state = AbsorbMessageBlock(state, blk)
         for _ in range(RoundCount):
-            state = PerformRound(state, blk, mv)
-    return ExtractDigest(FinalizeState(state))
+            state = PerformRound(state)
+    state = FinalizeState(state)
+    return ExtractDigest(state)
 
 
 # =========================================================
 #   SELF-TEST & CLI
 # =========================================================
 def run_selftest():
-    print("Running quick self-test...")
+    print("Running HLS-1024 v0.1 self-test...")
     msg = b"selftest"
-    if HLS1024Hash(msg) != HLS1024Hash(msg):
-        print("FAIL determinism")
+    d1 = HLS1024Hash(msg)
+    d2 = HLS1024Hash(msg)
+    if d1 != d2:
+        print("FAIL: Non-deterministic output")
         return
-    print("OK")
+    print("PASS: Deterministic")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="HLS-1024 v1.0-beta")
+    parser = argparse.ArgumentParser(description="HLS-1024 v0.1")
     parser.add_argument("-m", "--message", type=str, help="Message to hash")
     parser.add_argument("-f", "--file", type=str, help="File path to hash")
     parser.add_argument("--selftest", action="store_true")
