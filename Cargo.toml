@@ -1,0 +1,11 @@
+[package]
+name = "hls1024"
+version = "0.2.0"
+edition = "2021"
+
+[dependencies]
+# Replace num-bigint with num-bigint-dig for better performance (drop-in)
+num-bigint-dig = "0.4"
+num-traits = "0.2"
+sha3 = "0.10"
+hex = "0.4"
