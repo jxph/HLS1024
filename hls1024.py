@@ -218,18 +218,3 @@ if __name__ == "__main__":
         data = sys.stdin.buffer.read() or b""
 
     print(HLS1024Hash(data).hex())
-
-
-
-
-
-
-
-
-
-
-
-
-# vi9deo          ---
-#video --------------------------
-#
